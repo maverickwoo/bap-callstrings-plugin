@@ -47,6 +47,18 @@ let main project =
   Sqlite3EZ.with_db db_filename begin fun db ->
 
     (* q4: check if calls table exist; if not, reconstruct from cs3 table *)
+    let _recon_query = "
+insert into calls
+select null,
+       substr(cs1, 1, instr(cs1, \":\") - 1) as from_func,
+       substr(cs1, instr(cs1, \":\") + 1) as from_addr,
+       target as to_func,
+       target_addr as to_addr
+from (
+select distinct target, target_addr,
+        substr(cs||\",\", 1, instr(cs||\",\", \",\") - 1) as cs1 from cs3
+)
+" in
 
     gen_tree root 0L [] db |> sexp_of_tree
     |> Sexp.to_string_hum ~indent:2 |> print_endline
