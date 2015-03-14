@@ -128,6 +128,7 @@ let print_callstring k db =
       printf "%s%s <= %s\n" target target_addr csk
     end (fun _ _ -> ()) ()
 
+(* using the calls table compute a calls_scc table *)
 let compute_calls_scc db =
   let module V = String in
   let module E = struct
