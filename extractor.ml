@@ -3,9 +3,20 @@ open Bap.Std
 open Or_error
 open Program_visitor
 
-let insert_functions t db =
-  Sqlite3EZ.exec db
-    "
+let want_scc = ref false
+
+module GenericDotDumper = struct
+  let graph_attributes _ = []
+  let default_vertex_attributes _ = []
+  let vertex_name name = "\"" ^ name ^ "\""
+    let vertex_attributes _ = []
+    let get_subgraph _ = None
+    let default_edge_attributes _ = []
+    let edge_attributes _ = []
+end
+
+let schema_general =
+  "
 -- we prefer to keep the target column in csk as a symbol, so this table is not really needed
 create table functions (
   function_id integer primary key asc,
@@ -13,7 +24,7 @@ create table functions (
   begin_addr  integer,
   end_addr    integer
 );
--- think of this as the edge of a graph
+-- think of this as the edge of a graph (before and after scc)
 create table calls (
   call_id   integer primary key asc,
   from_func text,
@@ -21,18 +32,24 @@ create table calls (
   to_func   text,
   to_addr   integer
 );
--- think of this as the edge of a graph after scc contraction
 create table calls_scc (
   call_id   integer primary key asc,
   from_func text,
   from_addr integer,
-  to_func   text
+  to_func   text,
+  to_addr   integer default null -- need to decide what makes sense here
 );
 -- we use a view, but this can also be a table or even a materialized view
 create view cs1 as
   select calls.from_func as head, calls.from_func||\":\"||calls.from_addr as cs,
   calls.to_func as target, calls.to_addr as target_addr from calls;
-";
+create view cs1_scc as
+  select calls_scc.from_func as head, calls_scc.from_func||\":\"||calls_scc.from_addr as cs,
+  calls_scc.to_func as target, null as target_addr from calls_scc;
+"
+
+(* prepare the functions and calls table using BAP *)
+let insert_functions_and_calls t db =
   Table.iteri t.symbols ~f:begin fun smem src ->
     (* functions table *)
     let smin_addr = Memory.min_addr smem |> Word.to_int64 |> ok_exn in
@@ -71,24 +88,28 @@ create view cs1 as
 
 (* directly define cs(k) (we could also define cs2, cs3, ..., csk in order) *)
 let generate_csk_query k =          (* assert k >= 2 *)
-  let q1 = "select cs1.target as target, cs1.target_addr as target_addr,\n" in
+  let suffix = if !want_scc then "_scc" else "" in
+  let q1 = sprintf
+      "select cs1%s.target as target, cs1%s.target_addr as target_addr,\n"
+      suffix suffix
+  in
   let qcallstring =
     let percents = List.init k ~f:(fun _ -> "%s") |> String.concat ~sep:"," in
-    let csi = List.init k ~f:(fun i -> sprintf ", cs%d.cs" (i + 1))
+    let csi = List.init k ~f:(fun i -> sprintf ", cs%d%s.cs" (i + 1) suffix)
               |> String.concat ~sep:"" in (* reversed due to question 4 *)
-    sprintf "rtrim(printf(\"%s\"%s), \",\") as cs\n" percents csi
+    sprintf "  rtrim(printf(\"%s\"%s), \",\") as cs\n" percents csi
   in
-  let q3 = "from cs1\n" in
+  let q3 = sprintf "  from cs1%s\n" suffix in
   let qjoin = List.init (k - 1) ~f:begin fun i ->
-      sprintf "left join cs1 as cs%d on cs%d.head = cs%d.target\n"
-        (i + 2) (i + 1) (i + 2)
+      sprintf "  left join cs1%s as cs%d%s on cs%d%s.head = cs%d%s.target\n"
+        suffix (i + 2) suffix (i + 1) suffix (i + 2) suffix
     end |> String.concat ~sep:""
   in
-  let qorder = "order by target, target_addr" in (* optional *)
+  let qorder = "  order by target" in (* optional *)
   q1 ^ qcallstring ^ q3 ^ qjoin ^ qorder
 
 (* create view (but we can also create a table to cache the result) *)
-let create_csk k db =
+let create_csk_view k db =
   let csk = sprintf "cs%d" k in
   let query = generate_csk_query k in
   (* eprintf "%s\n" query; *)
@@ -97,24 +118,15 @@ let create_csk k db =
 (* print csk to stdout *)
 let print_callstring k db =
   let csk = sprintf "cs%d" k in
-  let stmt = Sqlite3EZ.make_statement db ("select * from " ^ csk) in
+  let stmt = Sqlite3EZ.make_statement db
+      ("select target, \":\"||target_addr, cs from " ^ csk) in
   Sqlite3EZ.statement_query stmt [||]
     begin fun data ->
       let target = Sqlite3EZ.Data.to_string data.(0) in
       let target_addr = Sqlite3EZ.Data.to_string data.(1) in
       let csk = Sqlite3EZ.Data.to_string data.(2) in
-      printf "%s:%s <= %s\n" target target_addr csk
+      printf "%s%s <= %s\n" target target_addr csk
     end (fun _ _ -> ()) ()
-
-module GenericDotDumper = struct
-  let graph_attributes _ = []
-  let default_vertex_attributes _ = []
-  let vertex_name name = "\"" ^ name ^ "\""
-    let vertex_attributes _ = []
-    let get_subgraph _ = None
-    let default_edge_attributes _ = []
-    let edge_attributes _ = []
-end
 
 let compute_calls_scc db =
   let module V = String in
@@ -154,7 +166,7 @@ let compute_calls_scc db =
     Dot.output_graph out g
   end;
   (* insert g into calls_scc *)
-  let query = "insert into calls_scc values (null, ?, ?, ?)" in
+  let query = "insert into calls_scc values (null, ?, ?, ?, null)" in
   let stmt = Sqlite3EZ.make_statement db query in
   G.iter_edges_e begin fun (u, label, v) ->
     Sqlite3EZ.(statement_exec stmt [|
@@ -167,19 +179,21 @@ let main project =
   (try Unix.unlink db_filename with _ -> ());
   Sqlite3EZ.with_db db_filename begin fun db ->
 
+    Sqlite3EZ.exec db schema_general;
+
     (* extract call relationship using BAP *)
-    insert_functions project db;
+    insert_functions_and_calls project db;
 
     (* if SCC, then replace the calls table with calls_scc *)
-    let calls_table = ref "calls" in
     (try
-       if Unix.getenv "SCC" = "true" then
+       if Unix.getenv "SCC" = "true" then begin
          compute_calls_scc db;
-       calls_table := "calls_scc"
+         want_scc := true
+       end
      with Not_found -> ());
 
     (* generate callstring using the correct table *)
-    create_csk 3 db;
+    create_csk_view 3 db;
     print_callstring 3 db;    (* hardcoded constant *)
   end;
   project
